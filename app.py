@@ -1,239 +1,215 @@
 import os
 import tempfile
+import time
 from pathlib import Path
-from typing import Iterable, List
+
+# --- CRITICAL: FORCE PRODUCTION ENDPOINT ---
+os.environ["GOOGLE_API_VERSION"] = "v1"
 
 import streamlit as st
 from dotenv import load_dotenv
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.documents import Document
+
+# --- DIRECT SDK FOR STABILITY ---
+import google.generativeai as genai
+
+# --- LANGCHAIN FOR RAG INFRASTRUCTURE ---
+from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
-from langchain_community.vectorstores import FAISS
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
-# Load environment variables (for local .env use)
 load_dotenv()
 
-# --- UI CONFIGURATION ---
-st.set_page_config(
-    page_title="RAG Document Assistant",
-    page_icon="📚",
-    layout="wide",
-)
+# --- UI CONFIGURATION & CENTERING ---
+st.set_page_config(page_title="RAG AI Assistant", page_icon="📚", layout="wide")
 
-# Custom CSS for the "Enterprise Dark" theme
-st.markdown(
-    """
+st.markdown("""
     <style>
+    /* Nuke Streamlit Headers and Banners */
+    header, [data-testid="stHeader"], [data-testid="stDecoration"], footer {
+        display: none !important;
+    }
     .stApp {
         background: linear-gradient(180deg, #0b1020 0%, #11162b 100%);
         color: #e8ecf8;
     }
+    
+    /* Absolute Centering Logic */
     .block-container {
-        max-width: 980px;
-        padding-top: 1.2rem;
-        padding-bottom: 1.6rem;
+        max-width: 900px;
+        margin: auto;
+        padding-top: 2rem;
     }
-    .app-title {
-        font-size: 1.8rem;
-        font-weight: 700;
-        margin-bottom: 0.2rem;
-        letter-spacing: 0.2px;
+    .centered-header {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+        width: 100%;
+        margin-bottom: 2.5rem;
     }
-    .app-subtitle {
+    .main-title {
+        font-size: 3rem;
+        font-weight: 800;
+        margin-bottom: 0.1rem;
+        background: -webkit-linear-gradient(#fff, #b8c0dd);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+    }
+    .main-subtitle {
         color: #b8c0dd;
-        margin-bottom: 1rem;
+        font-size: 1.1rem;
+    }
+    
+    /* File Chip Styling */
+    .chip-container {
+        display: flex;
+        justify-content: center;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        margin-bottom: 2rem;
     }
     .chip {
-        display: inline-block;
         border: 1px solid #2d3a67;
         color: #c7d2ff;
         background: rgba(45, 58, 103, 0.28);
         border-radius: 999px;
-        padding: 0.3rem 0.65rem;
-        margin-right: 0.35rem;
-        margin-bottom: 0.35rem;
-        font-size: 0.82rem;
+        padding: 0.35rem 0.8rem;
+        font-size: 0.85rem;
     }
+    
+    /* Chat Message Styling */
     .stChatMessage {
-        border: 1px solid rgba(126, 141, 196, 0.22);
-        border-radius: 14px;
-        background: rgba(16, 22, 44, 0.74);
-        backdrop-filter: blur(2px);
-        padding: 0.6rem;
-        margin-bottom: 1rem;
+        border: 1px solid rgba(126, 141, 196, 0.2);
+        border-radius: 12px;
+        background: rgba(16, 22, 44, 0.6);
+        padding: 1rem;
     }
     </style>
-    """,
-    unsafe_allow_html=True,
-)
+    """, unsafe_allow_html=True)
 
-# --- PROMPT TEMPLATE ---
-PROMPT_TEMPLATE = """
-You are a document QA assistant.
-Answer the question using ONLY the context provided below.
-If the answer is not present in the context, say:
-"I could not find that in the uploaded document(s)."
-Keep the answer concise and factual.
+# --- CORE LOGIC ---
 
-Context:
-{context}
+def _get_api_key():
+    key = st.secrets.get("GOOGLE_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not key:
+        st.error("Missing API Key. Check your .env file or Streamlit Secrets.")
+        st.stop()
+    return key
 
-Question:
-{question}
-"""
-
-# --- CORE FUNCTIONS ---
-
-def _get_google_api_key() -> str:
-    """Safely retrieves key from Streamlit secrets or environment variables."""
-    # 1. Try Streamlit Secrets (for Cloud deployment)
-    try:
-        if "GOOGLE_API_KEY" in st.secrets:
-            return st.secrets["GOOGLE_API_KEY"]
-    except Exception:
-        # If secrets file is missing locally, ignore the error and move to env
-        pass
-    
-    # 2. Try Environment Variables (for Local development via .env)
-    return os.getenv("GOOGLE_API_KEY", "")
-    
-def _load_uploaded_files(uploaded_files) -> List[Document]:
-    """Processes uploaded files and converts them into LangChain Documents."""
-    docs: List[Document] = []
+def _process_docs_batched(uploaded_files, api_key):
+    docs = []
     for uploaded in uploaded_files:
         suffix = Path(uploaded.name).suffix.lower()
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp.write(uploaded.getvalue())
-            temp_path = tmp.name
-
+            path = tmp.name
         try:
-            if suffix == ".pdf":
-                loader = PyPDFLoader(temp_path)
-            elif suffix in {".txt", ".md"}:
-                loader = TextLoader(temp_path, encoding="utf-8")
-            else:
-                continue
-            
-            loaded_docs = loader.load()
-            for doc in loaded_docs:
-                doc.metadata["source"] = uploaded.name
-            docs.extend(loaded_docs)
+            loader = PyPDFLoader(path) if suffix == ".pdf" else TextLoader(path)
+            docs.extend(loader.load())
         finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-    return docs
-
-def _build_vectorstore(docs: List[Document], api_key: str) -> FAISS:
-    """Splits documents and builds a FAISS vector store."""
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=150,
-        separators=["\n\n", "\n", ". ", " ", ""]
-    )
-    chunks = splitter.split_documents(docs)
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
-        google_api_key=api_key
-    )
-    return FAISS.from_documents(chunks, embeddings)
-
-def _answer_question(vectorstore: FAISS, question: str, api_key: str) -> str:
-    """Performs retrieval and generation using the LCEL chain syntax."""
-    # 1. Retrieval
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-    retrieved_docs = retriever.invoke(question)
-    context = "\n\n".join(doc.page_content for doc in retrieved_docs)
-
-    # 2. Generation (Gemini 1.5 Flash)
-    prompt = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-    model = ChatGoogleGenerativeAI(
-        model="gemini-1.5-flash",
-        temperature=0,
-        google_api_key=api_key
-    )
+            if os.path.exists(path): os.remove(path)
     
-    # Simple LCEL Chain
-    chain = prompt | model
-    response = chain.invoke({"context": context, "question": question})
-    return response.content
-
-# --- SESSION STATE INITIALIZATION ---
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
-
-# --- SIDEBAR ---
-with st.sidebar:
-    st.header("Knowledge Base")
-    st.caption("Upload files to ground the AI in your specific data.")
-
-    api_key = st.text_input(
-        "Google API Key",
-        type="password",
-        value=_get_google_api_key(),
-    )
-
-    uploaded_files = st.file_uploader(
-        "Upload documents",
-        type=["pdf", "txt", "md"],
-        accept_multiple_files=True,
-    )
-
-    if st.button("Process Documents", use_container_width=True):
-        if not api_key:
-            st.error("Missing Google API Key.")
-        elif not uploaded_files:
-            st.error("No documents uploaded.")
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+    chunks = splitter.split_documents(docs)
+    
+    # Using the standard embedding model
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001", google_api_key=api_key)
+    
+    # BATCHING LOGIC: Prevents 503 Server Disconnected errors
+    batch_size = 20
+    vectorstore = None
+    
+    progress_bar = st.progress(0, text="Embedding knowledge base...")
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i + batch_size]
+        if vectorstore is None:
+            vectorstore = FAISS.from_documents(batch, embeddings)
         else:
-            with st.spinner("Analyzing and Indexing..."):
-                documents = _load_uploaded_files(uploaded_files)
-                if documents:
-                    st.session_state.vectorstore = _build_vectorstore(documents, api_key)
-                    st.success(f"Indexed {len(documents)} document pages.")
-                else:
-                    st.error("Could not extract text from files.")
+            vectorstore.add_documents(batch)
+        
+        progress = min((i + batch_size) / len(chunks), 1.0)
+        progress_bar.progress(progress, text=f"Embedded {min(i+batch_size, len(chunks))} of {len(chunks)} chunks...")
+        time.sleep(0.3) # Anti-rate-limit jitter
+    
+    progress_bar.empty()
+    return vectorstore
 
-    if st.button("Clear Chat History", use_container_width=True):
+# --- APP START & STATE ---
+api_key = _get_api_key()
+genai.configure(api_key=api_key) # Initialize Direct SDK
+
+if "messages" not in st.session_state: st.session_state.messages = []
+if "vectorstore" not in st.session_state: st.session_state.vectorstore = None
+if "file_fingerprint" not in st.session_state: st.session_state.file_fingerprint = None
+
+# --- MAIN UI HEADERS ---
+st.markdown(
+    """
+    <div class="centered-header">
+        <div class="main-title">RAG Document Assistant</div>
+        <div class="main-subtitle">Auto-Indexing AI • Built on Gemini 2.5 Flash</div>
+    </div>
+    """, 
+    unsafe_allow_html=True
+)
+
+# --- SIDEBAR (Auto-Processing) ---
+with st.sidebar:
+    st.header("Settings")
+    uploaded_files = st.file_uploader("Drop Knowledge Here", type=["pdf", "txt", "md"], accept_multiple_files=True)
+    
+    if uploaded_files:
+        current_fp = "-".join([f"{f.name}_{f.size}" for f in uploaded_files])
+        if st.session_state.file_fingerprint != current_fp:
+            with st.status("Auto-Indexing Documents...", expanded=True) as status:
+                st.session_state.vectorstore = _process_docs_batched(uploaded_files, api_key)
+                st.session_state.file_fingerprint = current_fp
+                status.update(label="Ready to Chat!", state="complete", expanded=False)
+                
+    elif st.session_state.file_fingerprint is not None:
+        # User cleared files, reset state
+        st.session_state.vectorstore = None
+        st.session_state.file_fingerprint = None
+
+    st.divider()
+    if st.button("Clear Conversation", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
 
-# --- MAIN CHAT UI ---
-st.markdown('<div class="app-title">RAG Document Assistant</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="app-subtitle">Powered by Gemini 1.5 & LangChain. Grounded in your data.</div>',
-    unsafe_allow_html=True,
-)
-
-# Display file "chips" if files are uploaded
+# --- FILE CHIPS ---
 if uploaded_files:
     chips = "".join([f'<span class="chip">{f.name}</span>' for f in uploaded_files])
-    st.markdown(chips, unsafe_allow_html=True)
+    st.markdown(f'<div class="chip-container">{chips}</div>', unsafe_allow_html=True)
 
-# Display Chat Messages
+# --- CHAT DISPLAY & LOGIC ---
 for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+    with st.chat_message(msg["role"]): st.markdown(msg["content"])
 
-# User Input Logic
-if user_query := st.chat_input("Ask a question about the documents..."):
-    # Add user message to state
-    st.session_state.messages.append({"role": "user", "content": user_query})
-    with st.chat_message("user"):
-        st.markdown(user_query)
+if prompt := st.chat_input("Ask about your documents..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"): st.markdown(prompt)
 
-    # Validate state before processing
-    if not api_key:
-        ans = "Please provide a Google API Key in the sidebar."
-    elif st.session_state.vectorstore is None:
-        ans = "Please upload and 'Process' documents before asking questions."
-    else:
+    if st.session_state.vectorstore:
         with st.chat_message("assistant"):
-            with st.spinner("Consulting documents..."):
-                ans = _answer_question(st.session_state.vectorstore, user_query, api_key)
-                st.markdown(ans)
-    
-    # Save assistant response to state
-    st.session_state.messages.append({"role": "assistant", "content": ans})
+            with st.spinner("Thinking..."):
+                # 1. Retrieve context via LangChain & FAISS
+                retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 5})
+                context_docs = retriever.invoke(prompt)
+                context = "\n\n".join(d.page_content for d in context_docs)
+
+                # 2. Generate answer via DIRECT Google SDK (Bypasses LangChain 404 bugs)
+                try:
+                    # Using the stable 2.5 production model
+                    model = genai.GenerativeModel('gemini-2.5-flash')
+                    qa_prompt = f"Answer the question based ONLY on this context. If the answer is not in the context, say so.\n\nContext:\n{context}\n\nQuestion: {prompt}"
+                    
+                    response = model.generate_content(qa_prompt)
+                    ans = response.text
+                    
+                    st.markdown(ans)
+                    st.session_state.messages.append({"role": "assistant", "content": ans})
+                except Exception as e:
+                    st.error(f"API Error: {str(e)}")
+    else:
+        st.info("Drop a document in the sidebar to begin.")
